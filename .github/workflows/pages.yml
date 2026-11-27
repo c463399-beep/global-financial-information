@@ -3,6 +3,7 @@ name: Refresh and deploy
 on:
   schedule:
     # Every 4 hours, UTC. GitHub may start the run a few minutes late.
+    # One build refreshes the whole site, including the Nasdaq most-active section.
     - cron: "0 */4 * * *"
   workflow_dispatch:
   push:
@@ -31,7 +32,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Fetch data and build site
+      - name: Fetch Yahoo quotes, Nasdaq most-active list, and build site
         run: python scripts/build_site.py --out site
 
       - name: Setup Pages

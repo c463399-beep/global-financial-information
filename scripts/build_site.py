@@ -6,7 +6,12 @@ Prices, daily changes, and charts come from the public chart endpoint:
     https://query1.finance.yahoo.com/v8/finance/chart/<SYMBOL>?range=1mo&interval=1d
 
 Tencent fundamentals come from Yahoo's quoteSummary endpoint (the same data
-the Yahoo Finance quote page loads). Missing values are rendered as
+the Yahoo Finance quote page loads).
+
+The home page also lists the 10 most active Nasdaq-listed names by dollar
+volume. Nasdaq's public site does not keep a reliable tape of the largest
+individual prints after the session ends, so this is the Most Active by
+Dollar Volume ranking, not block prints. Missing values are rendered as
 "not available". This script never fills in a number that was not in a
 response.
 """
@@ -16,6 +21,7 @@ from __future__ import annotations
 import argparse
 import http.cookiejar
 import json
+import re
 import sys
 import time
 import urllib.error
@@ -25,6 +31,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from html import escape
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 HKT = timezone(timedelta(hours=8))
 USER_AGENT = (
@@ -119,6 +126,36 @@ SECTIONS = [
 ]
 
 TENCENT_SYMBOL = "0700.HK"
+NASDAQ_MOVERS_URL = "https://api.nasdaq.com/api/marketmovers?assetclass=stocks&limit=20"
+NASDAQ_INFO_URL = "https://api.nasdaq.com/api/quote/{symbol}/info?assetclass={asset}"
+NASDAQ_SOURCE = (
+    "Nasdaq market movers, Most Active by Dollar Volume "
+    "(api.nasdaq.com/api/marketmovers?assetclass=stocks)"
+)
+NASDAQ_LISTING_SOURCE = "Nasdaq quote info (api.nasdaq.com/api/quote/<SYMBOL>/info)"
+NASDAQ_LIMIT = 10
+NEW_YORK = ZoneInfo("America/New_York")
+_NASDAQ_TIME = re.compile(
+    r"^(?:Data as of\s+)?"
+    r"(?P<mon>[A-Za-z]{3})\s+(?P<day>\d{1,2}),\s+(?P<year>\d{4})"
+    r"(?:\s+(?P<clock>\d{1,2}:\d{2})\s*(?P<ampm>AM|PM))?"
+    r"(?:\s+(?P<tz>ET|EST|EDT))?$",
+    re.IGNORECASE,
+)
+_MONTHS = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
 
 
 def exchange_date(ts: int, gmtoffset: int):
@@ -458,7 +495,406 @@ def render_card(name: str, quote: dict) -> str:
     )
 
 
-def render_markets(groups: list[tuple[str, list[tuple[str, dict]]]], updated: datetime) -> str:
+def _text_or_none(value):
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if text == "" or text.upper() == "N/A":
+        return None
+    return text
+
+
+def is_nasdaq_exchange(exchange: str | None) -> bool:
+    """True when Nasdaq's quote page names a Nasdaq listing venue.
+
+    Nasdaq-listed ETFs come back with isNasdaqListed false and an exchange
+    such as NASDAQ-GM, so the exchange name is the check that matches the page.
+    """
+    if not exchange:
+        return False
+    return exchange.strip().upper().startswith("NASDAQ")
+
+
+def parse_nasdaq_timestamp(text: str | None) -> dict:
+    """Split a Nasdaq timestamp. A clock time is converted only when a zone is present.
+
+    A date with no clock stays a date. Nothing is invented to fill the clock.
+    """
+    empty = {"date": None, "dt": None, "clock": None, "tz": None}
+    raw = (text or "").strip()
+    match = _NASDAQ_TIME.match(raw)
+    if not match:
+        return empty
+    month = _MONTHS.get(match.group("mon").lower())
+    if month is None:
+        return empty
+    try:
+        day = int(match.group("day"))
+        year = int(match.group("year"))
+        date = datetime(year, month, day).date()
+    except ValueError:
+        return empty
+    clock = match.group("clock")
+    ampm = match.group("ampm")
+    tz_name = (match.group("tz") or "").upper() or None
+    if not clock or not ampm:
+        return {"date": date, "dt": None, "clock": None, "tz": tz_name}
+    hour_text, minute_text = clock.split(":")
+    hour = int(hour_text)
+    minute = int(minute_text)
+    if hour < 1 or hour > 12 or minute > 59:
+        return {"date": date, "dt": None, "clock": None, "tz": tz_name}
+    ampm = ampm.upper()
+    if ampm == "PM" and hour != 12:
+        hour += 12
+    elif ampm == "AM" and hour == 12:
+        hour = 0
+    if tz_name == "EST":
+        tzinfo = timezone(timedelta(hours=-5))
+    elif tz_name == "EDT":
+        tzinfo = timezone(timedelta(hours=-4))
+    elif tz_name == "ET":
+        tzinfo = NEW_YORK
+    else:
+        return {"date": date, "dt": None, "clock": f"{clock} {ampm}", "tz": None}
+    dt = datetime(year, month, day, hour, minute, tzinfo=tzinfo)
+    return {"date": date, "dt": dt, "clock": f"{clock} {ampm}", "tz": tz_name}
+
+
+def nasdaq_asof_label(raw: str | None) -> str:
+    parsed = parse_nasdaq_timestamp(raw)
+    if parsed["dt"] is not None:
+        return f"{hkt_full(parsed['dt'])} (Nasdaq: {str(raw).strip()})"
+    if raw and str(raw).strip():
+        return f"{NA} (Nasdaq: {str(raw).strip()})"
+    return NA
+
+
+def nasdaq_row_time_label(raw: str | None) -> str:
+    if not raw or not str(raw).strip():
+        return NA
+    parsed = parse_nasdaq_timestamp(str(raw))
+    if parsed["dt"] is not None:
+        return f"{hkt_full(parsed['dt'])} (Nasdaq: {str(raw).strip()})"
+    if parsed["date"] is not None:
+        return f"{parsed['date'].isoformat()} (clock time not available)"
+    return NA
+
+
+def direction_from_indicator(indicator, change_text) -> str:
+    label = str(indicator or "").strip().lower()
+    if label in ("up", "down"):
+        return label
+    if label in ("flat", "unch", "unchanged"):
+        return "flat"
+    text = str(change_text or "").strip()
+    if text.startswith("+"):
+        return "up"
+    if text.startswith("-") or text.startswith("−"):
+        return "down"
+    return "flat"
+
+
+def explicit_dollar_volume(row: dict, headers: dict | None) -> str | None:
+    """Dollar volume only when Nasdaq names the column. The % change column is not reused."""
+    if isinstance(headers, dict):
+        for key, label in headers.items():
+            if "dollar" in str(label or "").lower():
+                found = _text_or_none(row.get(key))
+                if found:
+                    return found
+    for key, value in row.items():
+        if "dollar" in str(key).lower():
+            found = _text_or_none(value)
+            if found:
+                return found
+    return None
+
+
+def parse_most_active_dollar_volume(payload: dict) -> dict:
+    stocks = ((payload or {}).get("data") or {}).get("STOCKS") or {}
+    block = stocks.get("MostActiveByDollarVolume") or {}
+    table = block.get("table") or {}
+    headers = table.get("headers") if isinstance(table.get("headers"), dict) else {}
+    rows = []
+    for raw in table.get("rows") or []:
+        if not isinstance(raw, dict):
+            continue
+        symbol = _text_or_none(raw.get("symbol"))
+        if not symbol:
+            continue
+        price = None
+        change = None
+        change_percent = None
+        share_volume = None
+        for key, label in headers.items():
+            text = str(label or "").strip().lower()
+            value = _text_or_none(raw.get(key))
+            if text in ("last", "last sale", "last sale price"):
+                price = value
+            elif text in ("% change", "percent change", "% chg"):
+                change_percent = value
+            elif text in ("change", "net change"):
+                change = value
+            elif "share volume" in text or text == "volume":
+                share_volume = value
+        if price is None:
+            price = _text_or_none(raw.get("lastSalePrice"))
+        if change is None:
+            change = _text_or_none(raw.get("lastSaleChange"))
+        if change_percent is None and share_volume is None and explicit_dollar_volume(raw, headers) is None:
+            change_percent = _text_or_none(raw.get("change"))
+        rows.append(
+            {
+                "symbol": symbol,
+                "name": _text_or_none(raw.get("name")),
+                "price": price,
+                "change": change,
+                "changePercent": change_percent,
+                "direction": direction_from_indicator(raw.get("deltaIndicator"), change),
+                "dollarVolume": explicit_dollar_volume(raw, headers),
+                "shareVolume": share_volume,
+                "shareVolumeSource": "Nasdaq market movers" if share_volume else None,
+            }
+        )
+    asof_raw = _text_or_none(block.get("dataAsOf")) or _text_or_none(block.get("lastTradeTimestamp"))
+    return {"asofRaw": asof_raw, "rows": rows}
+
+
+def parse_nasdaq_quote_info(payload: dict, asset: str) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict) or not data.get("symbol"):
+        return None
+    primary = data.get("primaryData") if isinstance(data.get("primaryData"), dict) else {}
+    exchange = _text_or_none(data.get("exchange"))
+    instrument = _text_or_none(data.get("stockType"))
+    instrument_source = None
+    if instrument:
+        instrument_source = "Nasdaq quote info stockType"
+    elif asset == "etf":
+        instrument = "ETF"
+        instrument_source = "Nasdaq quote assetclass=etf"
+    return {
+        "symbol": str(data.get("symbol")).strip(),
+        "name": _text_or_none(data.get("companyName")),
+        "exchange": exchange,
+        "nasdaqListed": is_nasdaq_exchange(exchange),
+        "instrument": instrument,
+        "instrumentSource": instrument_source,
+        "shareVolume": _text_or_none(primary.get("volume")),
+        "lastTradeRaw": _text_or_none(primary.get("lastTradeTimestamp")),
+        "assetClass": asset,
+    }
+
+
+def select_nasdaq_listed(mover_rows: list[dict], listings: dict, limit: int = NASDAQ_LIMIT):
+    """Keep Nasdaq-listed names in Nasdaq's dollar-volume order."""
+    selected = []
+    skipped = []
+    for row in mover_rows:
+        symbol = row.get("symbol") or ""
+        listing = listings.get(symbol.upper())
+        if not listing:
+            skipped.append({"symbol": symbol, "exchange": None, "reason": "listing not available"})
+            continue
+        if not listing.get("nasdaqListed"):
+            skipped.append(
+                {
+                    "symbol": symbol,
+                    "exchange": listing.get("exchange"),
+                    "reason": "exchange is not Nasdaq",
+                }
+            )
+            continue
+        share = row.get("shareVolume") or listing.get("shareVolume")
+        if row.get("shareVolume"):
+            share_source = row.get("shareVolumeSource")
+        elif listing.get("shareVolume"):
+            share_source = NASDAQ_LISTING_SOURCE
+        else:
+            share_source = None
+        selected.append(
+            {
+                "symbol": symbol,
+                "name": row.get("name") or listing.get("name"),
+                "price": row.get("price"),
+                "change": row.get("change"),
+                "changePercent": row.get("changePercent"),
+                "direction": row.get("direction") or "flat",
+                "dollarVolume": row.get("dollarVolume"),
+                "shareVolume": share,
+                "shareVolumeSource": share_source,
+                "exchange": listing.get("exchange"),
+                "instrument": listing.get("instrument"),
+                "instrumentSource": listing.get("instrumentSource"),
+                "lastTradeRaw": listing.get("lastTradeRaw"),
+            }
+        )
+        if len(selected) >= limit:
+            break
+    return selected, skipped
+
+
+def fetch_nasdaq_listing(symbol: str) -> dict | None:
+    for asset in ("stocks", "etf"):
+        url = NASDAQ_INFO_URL.format(symbol=urllib.parse.quote(symbol, safe=""), asset=asset)
+        try:
+            payload = json.loads(http_get(url).decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001 - try the other asset class, then skip
+            print(f"fail nasdaq {symbol} {asset} {exc.__class__.__name__}: {exc}", file=sys.stderr)
+            continue
+        listing = parse_nasdaq_quote_info(payload, asset)
+        if listing:
+            return listing
+    return None
+
+
+def fetch_nasdaq_most_active(sleep_s: float = 0.12, limit: int = NASDAQ_LIMIT) -> dict:
+    """10 Nasdaq-listed names from Nasdaq's public dollar-volume ranking.
+
+    Individual large prints are not used. Nasdaq's realtime-trades endpoint
+    is empty outside the session and is one symbol at a time, so it cannot
+    supply the largest prints of the latest session on a 4-hour refresh.
+    """
+    result = {
+        "ok": False,
+        "error": None,
+        "source": NASDAQ_SOURCE,
+        "listingSource": NASDAQ_LISTING_SOURCE,
+        "asofRaw": None,
+        "rows": [],
+        "skipped": [],
+    }
+    try:
+        payload = json.loads(http_get(NASDAQ_MOVERS_URL).decode("utf-8"))
+        parsed = parse_most_active_dollar_volume(payload)
+    except Exception as exc:  # noqa: BLE001 - the rest of the dashboard still publishes
+        result["error"] = f"{exc.__class__.__name__}: {exc}"
+        print(f"fail nasdaq movers {result['error']}", file=sys.stderr)
+        return result
+    if not parsed["rows"]:
+        result["error"] = "Most Active by Dollar Volume list was empty"
+        print("fail nasdaq movers empty", file=sys.stderr)
+        return result
+    listings = {}
+    confirmed = 0
+    for row in parsed["rows"]:
+        if sleep_s:
+            time.sleep(sleep_s)
+        listing = fetch_nasdaq_listing(row["symbol"])
+        listings[row["symbol"].upper()] = listing
+        if listing and listing.get("nasdaqListed"):
+            confirmed += 1
+            print(
+                f"ok  nasdaq {row['symbol']} {listing.get('exchange')} {row.get('price')}",
+                file=sys.stderr,
+            )
+        else:
+            exchange = None if not listing else listing.get("exchange")
+            print(f"skip nasdaq {row['symbol']} exchange={exchange}", file=sys.stderr)
+        if confirmed >= limit:
+            break
+    checked = [row for row in parsed["rows"] if row["symbol"].upper() in listings]
+    rows, skipped = select_nasdaq_listed(checked, listings, limit=limit)
+    result["ok"] = True
+    result["asofRaw"] = parsed["asofRaw"]
+    result["rows"] = rows
+    result["skipped"] = skipped
+    print(f"nasdaq most-active {len(rows)} listed names", file=sys.stderr)
+    return result
+
+
+def _show(value) -> str:
+    return NA if not value else escape(str(value))
+
+
+def render_nasdaq_section(nasdaq: dict | None) -> str:
+    """Homepage block. Labeled as a dollar-volume ranking, not as large prints."""
+    heading = "Most active Nasdaq-listed names by dollar volume"
+    lede = (
+        "These are not individual trades or block prints. "
+        "Nasdaq's public trade list is empty once the session ends, and it is not a market-wide ranking of the largest prints. "
+        "This table is Nasdaq's Most Active by Dollar Volume list for the latest session, "
+        "keeping a name only when its Nasdaq quote page shows a Nasdaq exchange (for example NASDAQ-GS or NASDAQ-GM). "
+        "Stocks and ETFs are both included, and the instrument type is shown when Nasdaq provides it. "
+        "The dollar-volume amount is shown only when that response includes it. "
+        "Share volume is copied as published from the quote page when the ranking row does not include it."
+    )
+    if not nasdaq or not nasdaq.get("ok"):
+        return (
+            "<section class='panel' id='nasdaq-most-active'>"
+            f"<h2>{heading}</h2>"
+            f"<p class='lede'>{lede}</p>"
+            f"<p class='price na'>{NA}</p>"
+            "</section>"
+        )
+    asof = nasdaq_asof_label(nasdaq.get("asofRaw"))
+    rows = nasdaq.get("rows") or []
+    if not rows:
+        body = f"<p class='price na'>{NA}</p>"
+    else:
+        body_rows = []
+        for index, row in enumerate(rows, start=1):
+            kind = row.get("direction") or "flat"
+            change = _show(row.get("change"))
+            percent = _show(row.get("changePercent"))
+            if row.get("change") or row.get("changePercent"):
+                change_html = f"<div class='chg {kind}'>{change} ({percent})</div>"
+            else:
+                change_html = f"<div class='chg na'>{NA}</div>"
+            meta = escape(row.get("symbol") or "")
+            if row.get("exchange"):
+                meta += f" · {escape(row['exchange'])}"
+            if row.get("instrument"):
+                meta += f" · {escape(row['instrument'])}"
+            name = escape(row.get("name") or NA)
+            body_rows.append(
+                "<tr>"
+                f"<td class='num'>{index}</td>"
+                f"<td><div class='name'>{name}<span class='sym'>{meta}</span></div></td>"
+                f"<td class='num'>{_show(row.get('price'))}</td>"
+                f"<td class='num'>{change_html}</td>"
+                f"<td class='num'>{_show(row.get('shareVolume'))}</td>"
+                f"<td class='num'>{_show(row.get('dollarVolume'))}</td>"
+                f"<td>{escape(nasdaq_row_time_label(row.get('lastTradeRaw')))}</td>"
+                "</tr>"
+            )
+        body = (
+            "<p class='when'>On a narrow screen, scroll the table sideways for share volume, dollar volume, and the as-of time.</p>"
+            "<div class='wrap'><table>"
+            "<thead><tr>"
+            "<th class='num'>#</th><th>Name</th><th class='num'>Last</th><th class='num'>Change</th>"
+            "<th class='num'>Share volume</th><th class='num'>Dollar volume</th><th>As of</th>"
+            "</tr></thead><tbody>"
+            + "".join(body_rows)
+            + "</tbody></table></div>"
+        )
+    count = len(rows)
+    count_line = (
+        f"<p class='when'>{count} name{'s' if count != 1 else ''} confirmed from Nasdaq's dollar-volume ranking. "
+        "Names on another exchange are left out. The table is not padded past the names Nasdaq published.</p>"
+        if rows
+        else "<p class='when'>No Nasdaq-listed name on this list could be confirmed.</p>"
+    )
+    return (
+        "<section class='panel' id='nasdaq-most-active'>"
+        f"<h2>{heading}</h2>"
+        f"<p class='lede'>{lede}</p>"
+        f"<p class='when'>As of {escape(asof)}. "
+        f"Source: {escape(nasdaq.get('source') or NASDAQ_SOURCE)}. "
+        f"Listing, instrument, and share volume: {escape(nasdaq.get('listingSource') or NASDAQ_LISTING_SOURCE)}.</p>"
+        f"{count_line}{body}"
+        "</section>"
+    )
+
+
+def render_markets(
+    groups: list[tuple[str, list[tuple[str, dict]]]],
+    updated: datetime,
+    nasdaq: dict | None = None,
+) -> str:
     sections = []
     for title, items in groups:
         cards = "".join(render_card(name, quote) for name, quote in items)
@@ -467,6 +903,7 @@ def render_markets(groups: list[tuple[str, list[tuple[str, dict]]]], updated: da
             note = "<p class='lede'>Treasury yields are in percent, as published by Yahoo Finance.</p>"
         sections.append(f"<section><h2>{escape(title)}</h2>{note}<div class='grid'>{cards}</div></section>")
     body = "\n".join(sections)
+    nasdaq_html = render_nasdaq_section(nasdaq)
     updated_text = hkt_full(updated)
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -474,7 +911,7 @@ def render_markets(groups: list[tuple[str, list[tuple[str, dict]]]], updated: da
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Global Markets</title>
-  <meta name="description" content="Global indices, FX, commodities, crypto, US yields, and VIX. Refreshed from Yahoo Finance.">
+  <meta name="description" content="Global indices, FX, commodities, crypto, US yields, VIX, and the 10 most active Nasdaq-listed names by dollar volume.">
   <link rel="stylesheet" href="assets/style.css">
 </head>
 <body>
@@ -487,10 +924,12 @@ def render_markets(groups: list[tuple[str, list[tuple[str, dict]]]], updated: da
     </div>
     <nav class="nav"><a href="tencent/">Tencent (0700.HK)</a></nav>
   </header>
+  {nasdaq_html}
   {body}
   <footer>
-    <p>Source: Yahoo Finance chart API (<span class="mono">v8/finance/chart</span>, range 1mo, interval 1d). Daily change is the last price minus the previous session's daily close. Market times are Hong Kong time.</p>
-    <p>Last updated {escape(updated_text)}. Pages are rebuilt every 4 hours by GitHub Actions.</p>
+    <p>Index, FX, commodity, crypto, yield, and VIX cards: Yahoo Finance chart API (<span class="mono">v8/finance/chart</span>, range 1mo, interval 1d). Daily change is the last price minus the previous session's daily close.</p>
+    <p>Nasdaq section: most active by dollar volume, not single trades. Prices and the ranking come from Nasdaq market movers. Exchange, instrument, and share volume come from the Nasdaq quote page. A missing figure is left as not available.</p>
+    <p>Last updated {escape(updated_text)}. Times are Hong Kong time. Pages, including the Nasdaq section, are rebuilt every 4 hours by GitHub Actions.</p>
   </footer>
 </main>
 </body>
@@ -985,6 +1424,7 @@ svg.spark { width: 100%; height: 32px; display: block; margin: 6px 0 2px; }
 .wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 0.9rem; min-width: 640px; }
 th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
 th { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
 .crumb { margin: 0 0 6px; font-size: 0.9rem; }
 footer { margin-top: 28px; font-size: 0.8rem; }
@@ -1023,6 +1463,8 @@ def build(out_dir: Path, sleep_s: float = 0.12) -> dict:
                 time.sleep(sleep_s)
         groups.append((title, rendered))
 
+    nasdaq = fetch_nasdaq_most_active(sleep_s=sleep_s)
+
     try:
         tencent = fetch_chart(TENCENT_SYMBOL, "1y")
         print(f"ok  {TENCENT_SYMBOL} {tencent['price']}", file=sys.stderr)
@@ -1043,7 +1485,7 @@ def build(out_dir: Path, sleep_s: float = 0.12) -> dict:
     (site / "assets").mkdir(parents=True, exist_ok=True)
     (site / "tencent").mkdir(parents=True, exist_ok=True)
     (site / "assets" / "style.css").write_text(STYLE, encoding="utf-8")
-    (site / "index.html").write_text(render_markets(groups, updated), encoding="utf-8")
+    (site / "index.html").write_text(render_markets(groups, updated, nasdaq), encoding="utf-8")
     (site / "tencent" / "index.html").write_text(render_tencent(tencent, rows, updated), encoding="utf-8")
     (site / ".nojekyll").write_text("", encoding="utf-8")
     data = {
@@ -1052,6 +1494,7 @@ def build(out_dir: Path, sleep_s: float = 0.12) -> dict:
         "okCount": ok_count,
         "symbolCount": total,
         "quotes": flat,
+        "nasdaqMostActive": nasdaq,
         "tencent": {
             "quote": {key: value for key, value in tencent.items() if key != "series"},
             "series": tencent.get("series") or [],

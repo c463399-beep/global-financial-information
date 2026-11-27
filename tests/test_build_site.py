@@ -11,10 +11,17 @@ from scripts.build_site import (
     decimals_for,
     failed_quote,
     format_number,
+    is_nasdaq_exchange,
+    nasdaq_asof_label,
+    nasdaq_row_time_label,
     parse_chart,
+    parse_most_active_dollar_volume,
+    parse_nasdaq_quote_info,
     render_card,
     render_markets,
+    render_nasdaq_section,
     render_tencent,
+    select_nasdaq_listed,
     tencent_financial_rows,
 )
 
@@ -199,6 +206,211 @@ class FinancialTests(unittest.TestCase):
         self.assertIn("2026-10-20 14:30 HKT", html)
         self.assertIn(NA, html)
         self.assertIn('href="../"', html)
+
+
+def _listing(symbol, exchange, volume="1,234.50", instrument="Common Stock", trade="Nov 25, 2026"):
+    return {
+        "symbol": symbol,
+        "name": symbol + " Name",
+        "exchange": exchange,
+        "nasdaqListed": is_nasdaq_exchange(exchange),
+        "instrument": instrument,
+        "instrumentSource": "Nasdaq quote info stockType",
+        "shareVolume": volume,
+        "lastTradeRaw": trade,
+        "assetClass": "stocks",
+    }
+
+
+class NasdaqMostActiveTests(unittest.TestCase):
+    def test_percent_column_is_not_treated_as_dollar_volume(self):
+        payload = {
+            "data": {
+                "STOCKS": {
+                    "MostActiveByDollarVolume": {
+                        "dataAsOf": "Data as of Nov 25, 2026 4:15 PM ET",
+                        "table": {
+                            "headers": {
+                                "symbol": "Symbol",
+                                "name": "Name",
+                                "lastSalePrice": "Last",
+                                "lastSaleChange": "Change",
+                                "change": "% Change",
+                            },
+                            "rows": [
+                                {
+                                    "symbol": "NVDA",
+                                    "name": "NVIDIA Corporation",
+                                    "lastSalePrice": "$149.3",
+                                    "lastSaleChange": "-6.08",
+                                    "change": "-3.913%",
+                                    "deltaIndicator": "down",
+                                }
+                            ],
+                        },
+                    }
+                }
+            }
+        }
+        parsed = parse_most_active_dollar_volume(payload)
+        row = parsed["rows"][0]
+        self.assertEqual(row["price"], "$149.3")
+        self.assertEqual(row["change"], "-6.08")
+        self.assertEqual(row["changePercent"], "-3.913%")
+        self.assertIsNone(row["dollarVolume"])
+        self.assertIsNone(row["shareVolume"])
+        self.assertEqual(parsed["asofRaw"], "Data as of Nov 25, 2026 4:15 PM ET")
+
+    def test_dollar_header_is_kept_and_share_volume_header_is_not_a_percent(self):
+        payload = {
+            "data": {
+                "STOCKS": {
+                    "MostActiveByDollarVolume": {
+                        "dataAsOf": "Nov 25, 2026 4:15 PM ET",
+                        "table": {
+                            "headers": {
+                                "symbol": "Symbol",
+                                "lastSalePrice": "Last",
+                                "lastSaleChange": "Change",
+                                "change": "Dollar Volume",
+                            },
+                            "rows": [
+                                {
+                                    "symbol": "AAPL",
+                                    "name": "Apple",
+                                    "lastSalePrice": "$355.58",
+                                    "lastSaleChange": "+1.51",
+                                    "change": "12,000,000",
+                                    "deltaIndicator": "up",
+                                }
+                            ],
+                        },
+                    }
+                }
+            }
+        }
+        row = parse_most_active_dollar_volume(payload)["rows"][0]
+        self.assertEqual(row["dollarVolume"], "12,000,000")
+        self.assertIsNone(row["changePercent"])
+        self.assertEqual(row["change"], "+1.51")
+
+    def test_et_clock_converts_to_hkt_and_a_bare_date_does_not(self):
+        winter = nasdaq_asof_label("Data as of Nov 25, 2026 4:15 PM ET")
+        self.assertIn("2026-11-26 05:15 HKT", winter)
+        self.assertIn("Nov 25, 2026 4:15 PM ET", winter)
+        summer = nasdaq_asof_label("Jul 15, 2026 4:15 PM ET")
+        self.assertIn("2026-07-16 04:15 HKT", summer)
+        bare = nasdaq_row_time_label("Nov 25, 2026")
+        self.assertEqual(bare, "2026-11-25 (clock time not available)")
+        self.assertNotIn(":", bare.split("(", 1)[0])
+        self.assertEqual(nasdaq_row_time_label(None), NA)
+        self.assertTrue(nasdaq_asof_label("not a time").startswith(NA))
+
+    def test_listing_uses_exchange_not_the_etf_flag(self):
+        qqq = parse_nasdaq_quote_info(
+            {
+                "data": {
+                    "symbol": "QQQ",
+                    "companyName": "Invesco QQQ Trust, Series 1",
+                    "exchange": "NASDAQ-GM",
+                    "isNasdaqListed": False,
+                    "stockType": None,
+                    "primaryData": {"volume": "81,996,734.464435", "lastTradeTimestamp": "Nov 25, 2026"},
+                },
+                "status": {"rCode": 200},
+            },
+            "etf",
+        )
+        self.assertTrue(qqq["nasdaqListed"])
+        self.assertEqual(qqq["instrument"], "ETF")
+        self.assertEqual(qqq["shareVolume"], "81,996,734.464435")
+        spy = parse_nasdaq_quote_info(
+            {"data": {"symbol": "SPY", "exchange": "PSE", "primaryData": {"volume": "10"}}, "status": {"rCode": 200}},
+            "etf",
+        )
+        self.assertFalse(spy["nasdaqListed"])
+        missing = parse_nasdaq_quote_info(
+            {"data": None, "status": {"rCode": 400, "bCodeMessage": [{"errorMessage": "Symbol not exists."}]}},
+            "stocks",
+        )
+        self.assertIsNone(missing)
+
+    def test_selection_keeps_nasdaq_order_and_stops_at_ten(self):
+        symbols = ["SPY", "NVDA", "QQQ"] + [f"N{i}" for i in range(9)]
+        rows = [
+            {
+                "symbol": symbol,
+                "name": symbol,
+                "price": "$1.00",
+                "change": "-0.10",
+                "changePercent": "-1%",
+                "direction": "down",
+                "dollarVolume": None,
+                "shareVolume": None,
+                "shareVolumeSource": None,
+            }
+            for symbol in symbols
+        ]
+        listings = {"SPY": _listing("SPY", "PSE", instrument="ETF")}
+        listings["NVDA"] = _listing("NVDA", "NASDAQ-GS", volume="366,571,889.978475")
+        listings["QQQ"] = _listing("QQQ", "NASDAQ-GM", instrument="ETF")
+        for index in range(9):
+            listings[f"N{index}"] = _listing(f"N{index}", "NASDAQ-GS")
+        selected, skipped = select_nasdaq_listed(rows, listings, limit=10)
+        self.assertEqual([row["symbol"] for row in selected], ["NVDA", "QQQ"] + [f"N{i}" for i in range(8)])
+        self.assertEqual(skipped[0]["symbol"], "SPY")
+        self.assertEqual(selected[0]["shareVolume"], "366,571,889.978475")
+        self.assertIsNone(selected[0]["dollarVolume"])
+
+    def test_section_labels_the_ranking_and_leaves_missing_dollar_volume_blank(self):
+        nasdaq = {
+            "ok": True,
+            "source": "Nasdaq market movers, Most Active by Dollar Volume",
+            "listingSource": "Nasdaq quote info",
+            "asofRaw": "Data as of Nov 25, 2026 4:15 PM ET",
+            "rows": [
+                {
+                    "symbol": "NVDA",
+                    "name": "NVIDIA Corporation",
+                    "price": "$149.3",
+                    "change": "-6.08",
+                    "changePercent": "-3.913%",
+                    "direction": "down",
+                    "dollarVolume": None,
+                    "shareVolume": "366,571,889.978475",
+                    "exchange": "NASDAQ-GS",
+                    "instrument": "Common Stock",
+                    "lastTradeRaw": "Nov 25, 2026",
+                }
+            ],
+            "skipped": [],
+        }
+        html = render_nasdaq_section(nasdaq)
+        self.assertIn("Most active Nasdaq-listed names by dollar volume", html)
+        self.assertIn("not individual trades or block prints", html)
+        self.assertIn("NVIDIA Corporation", html)
+        self.assertIn("NVDA", html)
+        self.assertIn("$149.3", html)
+        self.assertIn("-6.08", html)
+        self.assertIn("-3.913%", html)
+        self.assertIn("366,571,889.978475", html)
+        self.assertIn("Dollar volume", html)
+        self.assertIn(NA, html)
+        self.assertIn("2026-11-26 05:15 HKT", html)
+        self.assertIn("2026-11-25 (clock time not available)", html)
+        self.assertNotIn("Largest trades", html)
+        self.assertNotIn("$53,000,000,000", html)
+
+    def test_failed_list_is_not_available_and_home_still_renders(self):
+        html = render_nasdaq_section({"ok": False, "error": "HTTPError", "rows": []})
+        self.assertIn(NA, html)
+        self.assertIn("not individual trades or block prints", html)
+        self.assertNotIn("HTTPError", html)
+        groups = [(title, [(name, failed_quote(symbol, "x")) for name, symbol in items]) for title, items in SECTIONS]
+        page = render_markets(groups, datetime(2026, 10, 20, 6, 0, tzinfo=timezone.utc), {"ok": False, "rows": []})
+        self.assertIn("id='nasdaq-most-active'", page)
+        self.assertIn("2026-10-20 14:00 HKT", page)
+        self.assertIn("^IXIC", page)
 
 
 if __name__ == "__main__":
